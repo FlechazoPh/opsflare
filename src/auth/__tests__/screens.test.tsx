@@ -1,0 +1,1250 @@
+import React from 'react';
+import {
+  act,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from '@testing-library/react-native';
+import * as LocalAuthentication from 'expo-local-authentication';
+import * as SecureStore from 'expo-secure-store';
+import {
+  AppState,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  type AppStateStatus,
+} from 'react-native';
+import Onboarding from '@/app/onboarding';
+import Unlock from '@/app/unlock';
+import { AuthGateProvider, useAuth } from '../AuthGate';
+import { resetAutoLock } from '../autoLock';
+import {
+  advanceOnboarding,
+  createAccount,
+  createOnboardingAccount,
+  getAccount,
+} from '../localAccount';
+import { ThemeProvider } from '../../theme/ThemeContext';
+import { accent } from '../../theme/tokens';
+
+const mockStore = new Map<string, string>();
+const appStateListeners = new Set<(state: AppStateStatus) => void>();
+const appStateSpy = jest.spyOn(AppState, 'addEventListener');
+const originalCurrentStateDescriptor = Object.getOwnPropertyDescriptor(
+  AppState,
+  'currentState',
+);
+
+jest.mock('expo-secure-store', () => ({
+  getItemAsync: jest.fn(async (key: string) => mockStore.get(key) ?? null),
+  setItemAsync: jest.fn(async (key: string, value: string) => {
+    mockStore.set(key, value);
+  }),
+  deleteItemAsync: jest.fn(async (key: string) => {
+    mockStore.delete(key);
+  }),
+}));
+
+jest.mock('expo-crypto', () => ({
+  ...(() => {
+    const { createHash } = jest.requireActual('crypto') as {
+      createHash: (algorithm: 'sha256') => {
+        update: (input: string, encoding: 'utf8') => {
+          digest: (encoding: 'hex') => string;
+        };
+      };
+    };
+
+    return {
+      getRandomBytes: jest.fn((length: number) =>
+        new Uint8Array(length).fill(0xab),
+      ),
+      CryptoDigestAlgorithm: { SHA256: 'SHA-256' },
+      CryptoEncoding: { HEX: 'hex' },
+      digestStringAsync: jest.fn(
+        async (
+          algorithm: string,
+          input: string,
+          options?: { encoding?: string },
+        ) => {
+          if (algorithm !== 'SHA-256' || options?.encoding !== 'hex') {
+            throw new Error('Unexpected Expo Crypto digest options');
+          }
+
+          return createHash('sha256').update(input, 'utf8').digest('hex');
+        },
+      ),
+    };
+  })(),
+}));
+
+jest.mock('expo-local-authentication', () => ({
+  hasHardwareAsync: jest.fn(async () => false),
+  isEnrolledAsync: jest.fn(async () => false),
+  authenticateAsync: jest.fn(async () => ({ success: false })),
+}));
+
+jest.mock('lucide-react-native', () => ({
+  Activity: () => null,
+  ArrowRight: () => null,
+  Building2: () => null,
+  Check: () => null,
+  Cloud: () => null,
+  Eye: () => null,
+  EyeOff: () => null,
+  KeyRound: () => null,
+  Layers: () => null,
+  LockKeyhole: () => null,
+  Lock: () => null,
+  Mail: () => null,
+  ScanFace: () => null,
+  ShieldCheck: () => null,
+  Sparkles: () => null,
+  User: () => null,
+}));
+
+// The real module builds a redirect URI at import time, which needs an
+// expo-constants manifest. The connect flows themselves are covered in
+// src/__tests__/connectAccount.test.tsx; here OAuth stays unconfigured so the
+// onboarding flow continues through "Skip for now".
+jest.mock('../../cloudflare/oauth', () => ({
+  discovery: {},
+  appCallbackUrl: 'opsflare://oauth/callback',
+  authorize: jest.fn(),
+  getOauthConfig: () => null,
+  exchangeAuthorizationCode: jest.fn(),
+  fetchOauthIdentity: jest.fn(),
+}));
+
+jest.mock('expo-auth-session', () => ({
+  useAuthRequest: () => [null, null, jest.fn()],
+}));
+
+function AuthStatusProbe() {
+  const { status } = useAuth();
+  return <Text testID="auth-status">{status}</Text>;
+}
+
+function withProviders(ui: React.ReactElement | null) {
+  return (
+    <ThemeProvider>
+      <AuthGateProvider>
+        {ui}
+        <AuthStatusProbe />
+      </AuthGateProvider>
+    </ThemeProvider>
+  );
+}
+
+function renderWithProviders(ui: React.ReactElement) {
+  return render(withProviders(ui));
+}
+
+beforeEach(() => {
+  mockStore.clear();
+  appStateListeners.clear();
+  // A prompt left pending by an earlier test must not keep auto-lock
+  // suspended for the next one.
+  resetAutoLock();
+  Object.defineProperty(AppState, 'currentState', {
+    configurable: true,
+    value: 'active',
+  });
+  appStateSpy.mockImplementation((_type, listener) => {
+    appStateListeners.add(listener);
+    return {
+      remove: jest.fn(() => {
+        appStateListeners.delete(listener);
+      }),
+    };
+  });
+  jest
+    .mocked(SecureStore.getItemAsync)
+    .mockReset()
+    .mockImplementation(async (key: string) => mockStore.get(key) ?? null);
+  jest
+    .mocked(SecureStore.setItemAsync)
+    .mockReset()
+    .mockImplementation(async (key: string, value: string) => {
+      mockStore.set(key, value);
+    });
+  jest
+    .mocked(SecureStore.deleteItemAsync)
+    .mockReset()
+    .mockImplementation(async (key: string) => {
+      mockStore.delete(key);
+    });
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockReset()
+    .mockResolvedValue(false);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockReset()
+    .mockResolvedValue(false);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockReset()
+    .mockResolvedValue({ success: false, error: 'user_cancel' });
+});
+
+afterAll(() => {
+  appStateSpy.mockRestore();
+  if (originalCurrentStateDescriptor) {
+    Object.defineProperty(
+      AppState,
+      'currentState',
+      originalCurrentStateDescriptor,
+    );
+  }
+});
+
+test('runs the Figma onboarding flow and persists completion', async () => {
+  renderWithProviders(<Onboarding />);
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('no-account'),
+  );
+
+  fireEvent.press(await screen.findByText('Get Started'));
+  fireEvent.changeText(screen.getByTestId('organization'), 'Acme');
+  fireEvent.changeText(screen.getByTestId('name'), 'Ada');
+  fireEvent.changeText(screen.getByTestId('email'), 'ada@example.com');
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.changeText(screen.getByTestId('confirm'), 'hunter2secret');
+  fireEvent.press(screen.getByText('Create Account'));
+
+  expect(
+    await screen.findByText('Bind Cloudflare accounts'),
+  ).toBeTruthy();
+  expect(
+    screen.getByLabelText('Authorize with Cloudflare').props.accessibilityState
+      .disabled,
+  ).toBe(true);
+  expect(
+    screen.getByText(/Deploy oauth-relay first/),
+  ).toBeTruthy();
+
+  fireEvent.press(screen.getByText('Skip for now'));
+  expect(await screen.findByText("You're all set")).toBeTruthy();
+  fireEvent.press(screen.getByText('Enter Console'));
+
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+  );
+  expect(await getAccount()).toMatchObject({
+    organization: 'Acme',
+    email: 'ada@example.com',
+    onboardingComplete: true,
+    onboardingStep: 'done',
+  });
+});
+
+test('renders the welcome primary action as a full-width horizontal button', async () => {
+  renderWithProviders(<Onboarding />);
+
+  await screen.findByRole('button', { name: 'Get Started' });
+  const button = screen.UNSAFE_getByType(TouchableOpacity);
+
+  expect(StyleSheet.flatten(button.props.style)).toMatchObject({
+    backgroundColor: accent.orange,
+    flexDirection: 'row',
+    width: '100%',
+  });
+  expect(button.props.activeOpacity).toBe(0.8);
+});
+
+test('validates organization, email, password length, and confirmation', async () => {
+  renderWithProviders(<Onboarding />);
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('no-account'),
+  );
+
+  fireEvent.press(await screen.findByText('Get Started'));
+
+  expect(
+    screen.getByRole('button', { name: 'Create Account' }),
+  ).toBeDisabled();
+  expect(
+    screen.getByText('Fill in all fields to continue'),
+  ).toBeTruthy();
+
+  fireEvent.changeText(screen.getByTestId('organization'), 'Acme');
+  fireEvent.changeText(screen.getByTestId('name'), 'Ada');
+  fireEvent.changeText(screen.getByTestId('email'), 'invalid');
+  fireEvent.changeText(screen.getByTestId('password'), 'short');
+  fireEvent.changeText(screen.getByTestId('confirm'), 'different');
+  expect(screen.getByText('Enter a valid work email.')).toBeTruthy();
+  expect(
+    screen.getByText('Password must be at least 8 characters.'),
+  ).toBeTruthy();
+  expect(screen.getByText('Passwords do not match.')).toBeTruthy();
+});
+
+test('resumes an incomplete onboarding account at the persisted step', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+  await advanceOnboarding('done');
+
+  renderWithProviders(<Onboarding />);
+
+  expect(await screen.findByText("You're all set")).toBeTruthy();
+});
+
+test('does not expose an interactive welcome step before resume finishes', () => {
+  jest
+    .mocked(SecureStore.getItemAsync)
+    .mockImplementation(() => new Promise(() => undefined));
+
+  renderWithProviders(<Onboarding />);
+
+  expect(screen.getByTestId('onboarding-loading')).toBeTruthy();
+  expect(screen.queryByText('Get Started')).toBeNull();
+});
+
+test('resumes a newly created onboarding account at the connect step', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+
+  renderWithProviders(<Onboarding />);
+
+  expect(
+    await screen.findByText('Bind Cloudflare accounts'),
+  ).toBeTruthy();
+});
+
+test('centers the connection choices in the remaining step space', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+
+  renderWithProviders(<Onboarding />);
+  await screen.findByText('Bind Cloudflare accounts');
+
+  expect(screen.getByTestId('connection-choices')).toHaveStyle({
+    flex: 1,
+    justifyContent: 'center',
+  });
+});
+
+test('renders connection choices with static native touch styles', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+
+  renderWithProviders(<Onboarding />);
+  await screen.findByText('Bind Cloudflare accounts');
+
+  const authorize = screen
+    .UNSAFE_getAllByType(TouchableOpacity)
+    .find(
+      (instance) =>
+        instance.props.accessibilityLabel === 'Authorize with Cloudflare',
+  );
+
+  expect(authorize).toBeDefined();
+  expect(StyleSheet.flatten(authorize!.props.style)).toMatchObject({
+    flexDirection: 'row',
+    width: '100%',
+  });
+});
+
+test('preserves create form values when returning from connect', async () => {
+  renderWithProviders(<Onboarding />);
+  fireEvent.press(await screen.findByText('Get Started'));
+  fireEvent.changeText(screen.getByTestId('organization'), 'Acme');
+  fireEvent.changeText(screen.getByTestId('name'), 'Ada');
+  fireEvent.changeText(screen.getByTestId('email'), 'ada@example.com');
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.changeText(screen.getByTestId('confirm'), 'hunter2secret');
+  fireEvent.press(screen.getByText('Create Account'));
+
+  await screen.findByText('Bind Cloudflare accounts');
+  fireEvent.press(screen.getByText('Back'));
+
+  expect((await screen.findByTestId('organization')).props.value).toBe('Acme');
+  expect(screen.getByTestId('name').props.value).toBe('Ada');
+  expect(screen.getByTestId('email').props.value).toBe('ada@example.com');
+  expect(screen.getByTestId('password').props.value).toBe('hunter2secret');
+  expect(screen.getByTestId('confirm').props.value).toBe('hunter2secret');
+});
+
+test('keeps the create step open when the local account cannot be persisted', async () => {
+  jest
+    .mocked(SecureStore.setItemAsync)
+    .mockRejectedValueOnce(new Error('keychain unavailable'));
+  renderWithProviders(<Onboarding />);
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('no-account'),
+  );
+
+  fireEvent.press(await screen.findByText('Get Started'));
+  fireEvent.changeText(screen.getByTestId('organization'), 'Acme');
+  fireEvent.changeText(screen.getByTestId('name'), 'Ada');
+  fireEvent.changeText(screen.getByTestId('email'), 'ada@example.com');
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.changeText(screen.getByTestId('confirm'), 'hunter2secret');
+  fireEvent.press(screen.getByText('Create Account'));
+
+  expect(
+    await screen.findByText('Could not create the local account. Try again.'),
+  ).toBeTruthy();
+  expect(screen.getByText('Create your account')).toBeTruthy();
+  expect(await getAccount()).toBeNull();
+
+  fireEvent.press(screen.getByText('Create Account'));
+  expect(
+    await screen.findByText('Bind Cloudflare accounts'),
+  ).toBeTruthy();
+});
+
+test('keeps the connect step open when progress cannot be persisted', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+  jest
+    .mocked(SecureStore.setItemAsync)
+    .mockRejectedValueOnce(new Error('keychain unavailable'));
+
+  renderWithProviders(<Onboarding />);
+  fireEvent.press(await screen.findByText('Skip for now'));
+
+  expect(
+    await screen.findByText(
+      'Could not save onboarding progress. Try again.',
+    ),
+  ).toBeTruthy();
+  expect(screen.getByText('Bind Cloudflare accounts')).toBeTruthy();
+  expect((await getAccount())?.onboardingStep).toBe('connect');
+
+  fireEvent.press(screen.getByText('Skip for now'));
+  expect(await screen.findByText("You're all set")).toBeTruthy();
+});
+
+test('does not unlock when onboarding completion cannot be persisted', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+  await advanceOnboarding('done');
+  jest
+    .mocked(SecureStore.setItemAsync)
+    .mockRejectedValueOnce(new Error('keychain unavailable'));
+
+  renderWithProviders(<Onboarding />);
+  fireEvent.press(await screen.findByText('Enter Console'));
+
+  expect(
+    await screen.findByText('Could not finish setup. Try again.'),
+  ).toBeTruthy();
+  expect(screen.getByTestId('auth-status').props.children).not.toBe('unlocked');
+
+  fireEvent.press(screen.getByText('Enter Console'));
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+  );
+});
+
+test('stays locked when completion crosses a background transition', async () => {
+  await createOnboardingAccount(
+    { organization: 'Acme', name: 'Ada', email: 'ada@example.com' },
+    'hunter2secret',
+    false,
+  );
+  await advanceOnboarding('done');
+
+  let resolveWrite: (() => void) | undefined;
+  jest
+    .mocked(SecureStore.setItemAsync)
+    .mockImplementationOnce(
+      (key: string, value: string) =>
+        new Promise<void>((resolve) => {
+          resolveWrite = () => {
+            mockStore.set(key, value);
+            resolve();
+          };
+        }),
+    );
+
+  renderWithProviders(<Onboarding />);
+  fireEvent.press(await screen.findByText('Enter Console'));
+  await waitFor(() =>
+    expect(SecureStore.setItemAsync).toHaveBeenCalledTimes(3),
+  );
+  expect(
+    screen.getByRole('button', { name: 'Enter Console' }),
+  ).toBeDisabled();
+
+  act(() => {
+    appStateListeners.forEach((listener) => listener('background'));
+    appStateListeners.forEach((listener) => listener('active'));
+  });
+  await act(async () => {
+    resolveWrite?.();
+  });
+
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('locked'),
+  );
+});
+
+test('unlock shows an error for the wrong password', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.changeText(screen.getByTestId('password'), 'wrong');
+  fireEvent.press(screen.getByText('Unlock'));
+
+  expect(await screen.findByText('Incorrect password.')).toBeTruthy();
+});
+
+test('unlock opens the gate for the correct password', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('locked'),
+  );
+
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.press(screen.getByText('Unlock'));
+
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+  );
+});
+
+test('ignores a pending password success after the unlock screen unmounts', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  const view = renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  jest.mocked(SecureStore.getItemAsync).mockClear();
+
+  let resolveRead: ((value: string | null) => void) | undefined;
+  jest.mocked(SecureStore.getItemAsync).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveRead = resolve;
+      }),
+  );
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
+  await waitFor(() =>
+    expect(SecureStore.getItemAsync).toHaveBeenCalledTimes(1),
+  );
+
+  view.rerender(withProviders(null));
+  await act(async () => {
+    resolveRead?.(mockStore.get('local-account-v2') ?? null);
+  });
+
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('ignores a pending password rejection after the unlock screen unmounts', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  const view = renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  jest.mocked(SecureStore.getItemAsync).mockClear();
+
+  let rejectRead: ((reason: Error) => void) | undefined;
+  jest.mocked(SecureStore.getItemAsync).mockImplementationOnce(
+    () =>
+      new Promise((_, reject) => {
+        rejectRead = reject;
+      }),
+  );
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
+  await waitFor(() =>
+    expect(SecureStore.getItemAsync).toHaveBeenCalledTimes(1),
+  );
+
+  view.rerender(withProviders(null));
+  await act(async () => {
+    rejectRead?.(new Error('keychain unavailable'));
+  });
+
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('rejects an empty unlock password without reading storage again', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  jest.mocked(SecureStore.getItemAsync).mockClear();
+
+  fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
+
+  expect(await screen.findByText('Enter your password.')).toBeTruthy();
+  expect(SecureStore.getItemAsync).not.toHaveBeenCalled();
+});
+
+test('renders the busy password UI before reading SecureStore', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  jest.mocked(SecureStore.getItemAsync).mockClear();
+
+  let releaseFrame: (() => void) | undefined;
+  const animationFrameSpy = jest
+    .spyOn(globalThis, 'requestAnimationFrame')
+    .mockImplementation((callback) => {
+      releaseFrame = () => callback(0);
+      return 1;
+    });
+  let resolveRead: ((value: string | null) => void) | undefined;
+  jest.mocked(SecureStore.getItemAsync).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveRead = resolve;
+      }),
+  );
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
+
+  try {
+    await act(async () => {
+      await Promise.resolve();
+    });
+    const busyButton = screen.getByRole('button', {
+      name: 'Unlocking…',
+    });
+    expect(busyButton).toBeDisabled();
+    expect(screen.getByTestId('password').props.editable).toBe(false);
+    fireEvent.press(busyButton);
+    expect(SecureStore.getItemAsync).not.toHaveBeenCalled();
+
+    act(() => {
+      releaseFrame?.();
+    });
+    await waitFor(() =>
+      expect(SecureStore.getItemAsync).toHaveBeenCalledTimes(1),
+    );
+
+    await act(async () => {
+      resolveRead?.(mockStore.get('local-account-v2') ?? null);
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+    );
+  } finally {
+    animationFrameSpy.mockRestore();
+  }
+});
+
+test('keeps password and biometric authentication mutually exclusive', async () => {
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  jest.mocked(SecureStore.getItemAsync).mockClear();
+
+  let resolveRead: ((value: string | null) => void) | undefined;
+  jest.mocked(SecureStore.getItemAsync).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveRead = resolve;
+      }),
+  );
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+  const passwordButton = screen.getByRole('button', { name: 'Unlock' });
+  const biometricButton = screen.getByRole('button', {
+    name: 'Use Face ID / fingerprint',
+  });
+
+  act(() => {
+    fireEvent.press(passwordButton);
+    fireEvent.press(biometricButton);
+  });
+
+  await waitFor(() =>
+    expect(SecureStore.getItemAsync).toHaveBeenCalledTimes(1),
+  );
+  expect(LocalAuthentication.authenticateAsync).not.toHaveBeenCalled();
+  expect(
+    screen.getByRole('button', { name: 'Unlocking…' }),
+  ).toBeDisabled();
+  expect(
+    screen.getByRole('button', { name: 'Use Face ID / fingerprint' }),
+  ).toBeDisabled();
+
+  await act(async () => {
+    resolveRead?.(mockStore.get('local-account-v2') ?? null);
+  });
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+  );
+});
+
+test('does not start password verification while biometric authentication is pending', async () => {
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  let resolveBiometric:
+    | ((result: { success: false; error: 'user_cancel' }) => void)
+    | undefined;
+  jest.mocked(LocalAuthentication.authenticateAsync).mockImplementationOnce(
+    () =>
+      new Promise((resolve) => {
+        resolveBiometric = resolve;
+      }),
+  );
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  jest.mocked(SecureStore.getItemAsync).mockClear();
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+
+  fireEvent.press(
+    screen.getByRole('button', { name: 'Use Face ID / fingerprint' }),
+  );
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+  const animationFrameSpy = jest
+    .spyOn(globalThis, 'requestAnimationFrame')
+    .mockImplementation((callback) => {
+      callback(0);
+      return 1;
+    });
+  const passwordButton = screen.getByRole('button', { name: 'Unlock' });
+
+  try {
+    fireEvent.press(passwordButton);
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    expect(SecureStore.getItemAsync).not.toHaveBeenCalled();
+    expect(passwordButton).toBeDisabled();
+  } finally {
+    animationFrameSpy.mockRestore();
+    await act(async () => {
+      resolveBiometric?.({ success: false, error: 'user_cancel' });
+    });
+  }
+});
+
+test('clears a password error when the user edits again', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+  fireEvent.changeText(screen.getByTestId('password'), 'wrong');
+  fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
+  expect(await screen.findByText('Incorrect password.')).toBeTruthy();
+
+  fireEvent.changeText(screen.getByTestId('password'), 'wrong2');
+
+  expect(screen.queryByText('Incorrect password.')).toBeNull();
+});
+
+test('submits the password from the keyboard return action', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+  fireEvent.changeText(screen.getByTestId('password'), 'hunter2secret');
+
+  fireEvent(screen.getByTestId('password'), 'submitEditing');
+
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+  );
+});
+
+test('starts successful biometric authentication only after a user tap', async () => {
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockResolvedValue({ success: true });
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  const biometricButton = await screen.findByRole('button', {
+    name: 'Use Face ID / fingerprint',
+  });
+  expect(LocalAuthentication.authenticateAsync).not.toHaveBeenCalled();
+
+  fireEvent.press(biometricButton);
+
+  await waitFor(() =>
+    expect(screen.getByTestId('auth-status').props.children).toBe('unlocked'),
+  );
+  expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledWith(
+    expect.objectContaining({
+      biometricsSecurityLevel: 'strong',
+      disableDeviceFallback: true,
+      promptMessage: 'Unlock Opsflare',
+    }),
+  );
+});
+
+test('reports unavailable biometric hardware without opening the native prompt', async () => {
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+
+  const alert = await screen.findByRole('alert');
+  expect(alert.props.children).toBe(
+    'Biometric authentication is not available on this device. Use your password.',
+  );
+  expect(LocalAuthentication.isEnrolledAsync).not.toHaveBeenCalled();
+  expect(LocalAuthentication.authenticateAsync).not.toHaveBeenCalled();
+  expect(screen.getByTestId('password').props.editable).toBe(true);
+  expect(screen.getByRole('button', { name: 'Unlock' })).toBeEnabled();
+});
+
+test('reports missing biometric enrollment without opening the native prompt', async () => {
+  jest.mocked(LocalAuthentication.hasHardwareAsync).mockResolvedValue(true);
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+
+  const alert = await screen.findByRole('alert');
+  expect(alert.props.children).toBe(
+    'Set up Face ID or fingerprint in device settings, then try again.',
+  );
+  expect(LocalAuthentication.authenticateAsync).not.toHaveBeenCalled();
+  expect(screen.getByTestId('password').props.editable).toBe(true);
+  expect(screen.getByRole('button', { name: 'Unlock' })).toBeEnabled();
+});
+
+test.each([
+  [
+    'not_available',
+    'Biometric authentication is unavailable. Use your password.',
+  ],
+  [
+    'authentication_failed',
+    'Face ID or fingerprint was not recognized. Try again or use your password.',
+  ],
+] as const)('reports the %s native biometric result', async (error, message) => {
+  jest.mocked(LocalAuthentication.hasHardwareAsync).mockResolvedValue(true);
+  jest.mocked(LocalAuthentication.isEnrolledAsync).mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockResolvedValue({ success: false, error });
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+
+  const alert = await screen.findByRole('alert');
+  expect(alert.props.children).toBe(message);
+  expect(screen.getByTestId('password').props.editable).toBe(true);
+  expect(screen.getByRole('button', { name: 'Unlock' })).toBeEnabled();
+});
+
+test('reports a rejected native biometric call and keeps password unlock usable', async () => {
+  jest.mocked(LocalAuthentication.hasHardwareAsync).mockResolvedValue(true);
+  jest.mocked(LocalAuthentication.isEnrolledAsync).mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockRejectedValue(new Error('native prompt failed'));
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+
+  const alert = await screen.findByRole('alert');
+  expect(alert.props.children).toBe(
+    'Biometric authentication is unavailable. Use your password.',
+  );
+  expect(screen.getByTestId('password').props.editable).toBe(true);
+  expect(screen.getByRole('button', { name: 'Unlock' })).toBeEnabled();
+});
+
+test.each(
+  ['user_cancel', 'app_cancel', 'system_cancel', 'user_fallback'] as const,
+)(
+  'keeps %s biometric cancellation silent and restores the action',
+  async (error) => {
+    jest.mocked(LocalAuthentication.hasHardwareAsync).mockResolvedValue(true);
+    jest.mocked(LocalAuthentication.isEnrolledAsync).mockResolvedValue(true);
+    jest
+      .mocked(LocalAuthentication.authenticateAsync)
+      .mockResolvedValue({ success: false, error });
+    await createAccount('Ada', 'hunter2secret', true);
+    renderWithProviders(<Unlock />);
+
+    fireEvent.press(
+      await screen.findByRole('button', {
+        name: 'Use Face ID / fingerprint',
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Use Face ID / fingerprint' }),
+      ).toBeEnabled(),
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByTestId('password').props.editable).toBe(true);
+    expect(screen.getByRole('button', { name: 'Unlock' })).toBeEnabled();
+  },
+);
+
+test.each(
+  ['user_cancel', 'app_cancel', 'system_cancel', 'user_fallback'] as const,
+)(
+  'keeps a rejected %s coded biometric cancellation silent and restores the action',
+  async (code) => {
+    jest.mocked(LocalAuthentication.hasHardwareAsync).mockResolvedValue(true);
+    jest.mocked(LocalAuthentication.isEnrolledAsync).mockResolvedValue(true);
+    jest
+      .mocked(LocalAuthentication.authenticateAsync)
+      .mockRejectedValue(
+        Object.assign(new Error('native prompt cancelled'), { code }),
+      );
+    await createAccount('Ada', 'hunter2secret', true);
+    renderWithProviders(<Unlock />);
+
+    fireEvent.press(
+      await screen.findByRole('button', {
+        name: 'Use Face ID / fingerprint',
+      }),
+    );
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'Use Face ID / fingerprint' }),
+      ).toBeEnabled(),
+    );
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.getByTestId('password').props.editable).toBe(true);
+    expect(screen.getByRole('button', { name: 'Unlock' })).toBeEnabled();
+  },
+);
+
+test('clears an old password error when biometric authentication starts', async () => {
+  let resolvePrompt:
+    | ((value: { success: false; error: 'user_cancel' }) => void)
+    | undefined;
+  jest.mocked(LocalAuthentication.hasHardwareAsync).mockResolvedValue(true);
+  jest.mocked(LocalAuthentication.isEnrolledAsync).mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.changeText(screen.getByTestId('password'), 'wrong');
+  fireEvent.press(screen.getByRole('button', { name: 'Unlock' }));
+  expect(await screen.findByText('Incorrect password.')).toBeTruthy();
+
+  fireEvent.press(
+    screen.getByRole('button', { name: 'Use Face ID / fingerprint' }),
+  );
+
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+  expect(screen.queryByRole('alert')).toBeNull();
+
+  await act(async () => {
+    resolvePrompt?.({ success: false, error: 'user_cancel' });
+  });
+});
+
+test('unlocks when the biometric prompt resigns the active state', async () => {
+  let resolvePrompt: ((value: { success: true }) => void) | undefined;
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+
+  // iOS drops the app out of `active` for as long as the Face ID sheet is up.
+  act(() => {
+    appStateListeners.forEach((listener) => listener('inactive'));
+  });
+
+  await act(async () => {
+    resolvePrompt?.({ success: true });
+  });
+
+  expect(screen.getByTestId('auth-status').props.children).toBe('unlocked');
+});
+
+test('ignores a pending biometric success after the unlock screen unmounts', async () => {
+  let resolvePrompt: ((value: { success: true }) => void) | undefined;
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+  await createAccount('Ada', 'hunter2secret', true);
+  const view = renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+
+  view.rerender(withProviders(null));
+  await act(async () => {
+    resolvePrompt?.({ success: true });
+  });
+
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('ignores a pending biometric rejection after the unlock screen unmounts', async () => {
+  let rejectPrompt: ((reason: Error) => void) | undefined;
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectPrompt = reject;
+        }),
+    );
+  await createAccount('Ada', 'hunter2secret', true);
+  const view = renderWithProviders(<Unlock />);
+
+  fireEvent.press(
+    await screen.findByRole('button', {
+      name: 'Use Face ID / fingerprint',
+    }),
+  );
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+
+  view.rerender(withProviders(null));
+  await act(async () => {
+    rejectPrompt?.(new Error('native prompt failed'));
+  });
+
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('keeps biometric rejection contained and leaves retry available', async () => {
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockRejectedValue(new Error('native prompt failed'));
+  await createAccount('Ada', 'hunter2secret', true);
+
+  renderWithProviders(<Unlock />);
+
+  const biometricButton = await screen.findByRole('button', {
+    name: 'Use Face ID / fingerprint',
+  });
+  fireEvent.press(biometricButton);
+
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+  await waitFor(() => expect(biometricButton).toBeEnabled());
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('does not start automatic biometrics after the app backgrounds', async () => {
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  await createAccount('Ada', 'hunter2secret', true);
+
+  renderWithProviders(<Unlock />);
+  act(() => {
+    appStateListeners.forEach((listener) => listener('background'));
+  });
+
+  await screen.findByText('Welcome back, Ada');
+  await act(async () => undefined);
+
+  expect(LocalAuthentication.authenticateAsync).not.toHaveBeenCalled();
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('does not start automatic biometrics when mounted outside the foreground', async () => {
+  const currentStateDescriptor = Object.getOwnPropertyDescriptor(
+    AppState,
+    'currentState',
+  );
+  Object.defineProperty(AppState, 'currentState', {
+    configurable: true,
+    value: 'background',
+  });
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  await createAccount('Ada', 'hunter2secret', true);
+
+  try {
+    renderWithProviders(<Unlock />);
+    await screen.findByText('Welcome back, Ada');
+    await act(async () => undefined);
+
+    expect(LocalAuthentication.authenticateAsync).not.toHaveBeenCalled();
+    expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+  } finally {
+    if (currentStateDescriptor) {
+      Object.defineProperty(
+        AppState,
+        'currentState',
+        currentStateDescriptor,
+      );
+    }
+  }
+});
+
+test('serializes double biometric triggers and restores the busy action after rejection', async () => {
+  let rejectManualPrompt: ((reason: Error) => void) | undefined;
+  jest
+    .mocked(LocalAuthentication.hasHardwareAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.isEnrolledAsync)
+    .mockResolvedValue(true);
+  jest
+    .mocked(LocalAuthentication.authenticateAsync)
+    .mockImplementationOnce(
+      () =>
+        new Promise((_, reject) => {
+          rejectManualPrompt = reject;
+        }),
+    );
+  await createAccount('Ada', 'hunter2secret', true);
+  renderWithProviders(<Unlock />);
+
+  const biometricButton = await screen.findByRole('button', {
+    name: 'Use Face ID / fingerprint',
+  });
+
+  fireEvent.press(biometricButton);
+  fireEvent.press(biometricButton);
+
+  await waitFor(() =>
+    expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1),
+  );
+  expect(biometricButton).toBeDisabled();
+  expect(biometricButton.props.accessibilityState).toMatchObject({
+    busy: true,
+    disabled: true,
+  });
+
+  await act(async () => {
+    rejectManualPrompt?.(new Error('native prompt failed'));
+  });
+
+  await waitFor(() => expect(biometricButton).toBeEnabled());
+  expect(LocalAuthentication.authenticateAsync).toHaveBeenCalledTimes(1);
+  expect(screen.getByTestId('auth-status').props.children).toBe('locked');
+});
+
+test('renders the unlock primary action as a static full-width native button', async () => {
+  await createAccount('Ada', 'hunter2secret', false);
+  renderWithProviders(<Unlock />);
+  await screen.findByText('Welcome back, Ada');
+
+  const button = screen.UNSAFE_getByType(TouchableOpacity);
+
+  expect(button.props.accessibilityLabel).toBe('Unlock');
+  expect(StyleSheet.flatten(button.props.style)).toMatchObject({
+    alignItems: 'center',
+    backgroundColor: accent.orange,
+    flexDirection: 'row',
+    minHeight: 52,
+    width: '100%',
+  });
+  expect(button.props.activeOpacity).toBe(0.8);
+});
