@@ -21,6 +21,13 @@ URL 的 Cloudflare OAuth 客户端。
 - DNS、缓存、SSL、防火墙、R2、KV、D1、Workers、Pages 等页面
 - 界面提供英文和简体中文
 
+## 截图
+
+| 总览 | 快捷入口 | 设置 |
+| --- | --- | --- |
+| ![总览（简体中文）](docs/screenshots/home-overview-zh.png) | ![快捷入口（简体中文）](docs/screenshots/home-shortcuts-zh.png) | ![设置（简体中文）](docs/screenshots/settings-zh.png) |
+| ![Overview in English](docs/screenshots/home-overview-en.png) | ![Quick access in English](docs/screenshots/home-shortcuts-en.png) | ![Settings in English](docs/screenshots/settings-en.png) |
+
 ## 开发
 
 ```sh

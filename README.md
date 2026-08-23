@@ -23,6 +23,13 @@ uses that URL.
 - DNS, cache, SSL, firewall, R2, KV, D1, Workers, and Pages screens
 - English and Simplified Chinese interface
 
+## Screenshots
+
+| Home | Shortcuts | Settings |
+| --- | --- | --- |
+| ![Overview in English](docs/screenshots/home-overview-en.png) | ![Quick access in English](docs/screenshots/home-shortcuts-en.png) | ![Settings in English](docs/screenshots/settings-en.png) |
+| ![总览（简体中文）](docs/screenshots/home-overview-zh.png) | ![快捷入口（简体中文）](docs/screenshots/home-shortcuts-zh.png) | ![设置（简体中文）](docs/screenshots/settings-zh.png) |
+
 ## Development
 
 ```sh
