@@ -6,12 +6,14 @@ import type { ConfigContext, ExpoConfig } from 'expo/config';
  */
 export default ({ config }: ConfigContext): ExpoConfig => ({
   ...config,
+  name: config.name ?? 'Opsflare',
+  slug: config.slug ?? 'opsflare',
   extra: {
     ...config.extra,
     cloudflareOauth: {
       clientId: process.env.EXPO_PUBLIC_CF_OAUTH_CLIENT_ID?.trim() ?? '',
       redirectUri: process.env.EXPO_PUBLIC_CF_OAUTH_REDIRECT_URI?.trim() ?? '',
-      scopes: [],
+      scopes: [] as string[],
     },
   },
 });
