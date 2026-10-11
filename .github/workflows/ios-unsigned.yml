@@ -27,8 +27,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Align Expo SDK patches (Xcode 26 / Swift 6.2 fixes)
-        run: npx expo install --fix
+      - name: Upgrade expo-modules-jsi (upstream Swift 6.2 fix in 57.0.8)
+        run: npm install --no-save expo-modules-jsi@57.0.8
 
       - name: Expo prebuild (iOS)
         run: npx expo prebuild --platform ios --clean
