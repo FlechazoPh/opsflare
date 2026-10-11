@@ -106,11 +106,12 @@ jobs:
           # resolve. Only the throwing overload is affected; the nonthrowing one
           # inlines into clients fine.
           #
-          # ADDITIONALLY: Swift 6.2's interface reader drops where-clause
-          # requirements on this declaration, so the client mangles the generic
-          # differently from the library -> dyld mismatch. Declaring it with NO
-          # explicit requirements (throws(E) implies E: Error) aligns both sides.
-          # `@_disfavoredOverload` keeps overload resolution unambiguous.
+          # ADDITIONALLY: Swift 6.2 mangles the library's inferred `E: Error`
+          # requirement (from throws(E)) differently than the client's interface
+          # reader does -> dyld mismatch. Using untyped `throws` (no generic E
+          # at all) sidesteps the issue entirely. `@_disfavoredOverload` keeps
+          # overload resolution unambiguous. All 7 client call sites just use
+          # `try` without relying on the concrete error type, so this is safe.
           old = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
@@ -119,15 +120,26 @@ jobs:
             "  public static func assumeIsolated<T: ~Copyable, E: Error>(\n"
             "    _ operation: @JavaScriptActor () throws(E) -> T\n"
             "  ) throws(E) -> T {\n"
+            "    // Casting a `throws(E)` function value requires newer OS runtime support. Wrapping the\n"
+            "    // operation in the nonthrowing fast path keeps this backdeployable and stack-allocated.\n"
+            "    let result: Result<T, E> = assumeIsolated {\n"
+            "      return Result(catching: operation)\n"
+            "    }\n"
+            "    return try result.get()\n"
+            "  }\n"
           )
           new = (
-            "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
-            "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
+            "  /// Throwing counterpart to the nonthrowing overload above.\n"
             "  @_disfavoredOverload\n"
             "  @inline(__always)\n"
-            "  public static func assumeIsolated<T, E>(\n"
-            "    _ operation: @JavaScriptActor () throws(E) -> T\n"
-            "  ) throws(E) -> T {\n"
+            "  public static func assumeIsolated<T>(\n"
+            "    _ operation: @JavaScriptActor () throws -> T\n"
+            "  ) throws -> T {\n"
+            "    let result: Result<T, any Error> = assumeIsolated {\n"
+            "      return Result(catching: operation)\n"
+            "    }\n"
+            "    return try result.get()\n"
+            "  }\n"
           )
           assert src.count(old) == 1, "throwing assumeIsolated pattern not found"
           src = src.replace(old, new)
