@@ -106,11 +106,14 @@ jobs:
           # resolve. Only the throwing overload is affected; the nonthrowing one
           # inlines into clients fine.
           #
-          # ADDITIONALLY: Swift 6.2 serializes `<T: ~Copyable, E: Error>` into the
-          # swiftinterface as `<T, E> where E: Error, T: ~Copyable`, and the two
-          # forms mangle differently -> dyld mismatch. Writing the source in the
-          # same where-clause form aligns both sides (semantically identical, so
-          # no overload ambiguity).
+          # ADDITIONALLY: Swift 6.2's interface reader mishandles `~Copyable` in
+          # the swiftinterface where clause (it drops the requirements, so the
+          # client mangles the generic differently from the library -> dyld
+          # mismatch). Removing `~Copyable` from the source avoids the issue.
+          # `@_disfavoredOverload` keeps overload resolution unambiguous: the
+          # nonthrowing overload is preferred for non-throwing closures, the
+          # throwing one is used only when the closure throws (all existing
+          # callers already satisfy T: Copyable).
           old = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
@@ -123,10 +126,11 @@ jobs:
           new = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
+            "  @_disfavoredOverload\n"
             "  @inline(__always)\n"
-            "  public static func assumeIsolated<T, E>(\n"
+            "  public static func assumeIsolated<T, E: Error>(\n"
             "    _ operation: @JavaScriptActor () throws(E) -> T\n"
-            "  ) throws(E) -> T where E: Error, T: ~Copyable {\n"
+            "  ) throws(E) -> T {\n"
           )
           assert src.count(old) == 1, "throwing assumeIsolated pattern not found"
           src = src.replace(old, new)
