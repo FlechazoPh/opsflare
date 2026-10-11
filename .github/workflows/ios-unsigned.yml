@@ -30,6 +30,14 @@ jobs:
       - name: Upgrade expo-modules-jsi (upstream Swift 6.2 fix in 57.0.8)
         run: npm install --no-save expo-modules-jsi@57.0.8
 
+      - name: Patch expo-modules-jsi header for Xcode 26 clang
+        run: |
+          H="node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI-Cxx/include/RuntimeScheduler.h"
+          # 57.0.8 annotates C++ constructors with SWIFT_RETURNS_RETAINED, which
+          # Xcode 26's clang rejects. Strip the annotation (restores 57.0.4 behavior).
+          sed -i '' 's/SWIFT_RETURNS_RETAINED RuntimeScheduler(/RuntimeScheduler(/' "$H"
+          grep -n "SWIFT_RETURNS_RETAINED" "$H" || echo "header patched clean"
+
       - name: Expo prebuild (iOS)
         run: npx expo prebuild --platform ios --clean
 
