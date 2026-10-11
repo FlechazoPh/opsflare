@@ -1,0 +1,82 @@
+name: iOS unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/ios-unsigned.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-ios-unsigned:
+    runs-on: macos-15
+    env:
+      CI: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Expo prebuild (iOS)
+        run: npx expo prebuild --platform ios --clean
+
+      - name: Install CocoaPods dependencies
+        run: cd ios && pod install
+
+      - name: Archive without code signing
+        run: |
+          set -e
+          xcodebuild \
+            -workspace ios/Opsflare.xcworkspace \
+            -scheme Opsflare \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath build/derived \
+            -archivePath build/Opsflare.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGN_STYLE=Manual \
+            archive
+
+      - name: Package unsigned IPA
+        run: |
+          set -e
+          APP_PATH="build/Opsflare.xcarchive/Products/Applications/Opsflare.app"
+          test -d "$APP_PATH" || { echo "App bundle not found at $APP_PATH"; ls -R build/Opsflare.xcarchive/Products || true; exit 1; }
+          rm -rf Payload Opsflare-unsigned.ipa
+          mkdir -p Payload
+          cp -R "$APP_PATH" Payload/
+          ditto -c -k --sequesterRsrc --keepParent Payload Opsflare-unsigned.ipa
+          unzip -tq Opsflare-unsigned.ipa
+          ls -lh Opsflare-unsigned.ipa
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: opsflare-unsigned-ipa
+          path: Opsflare-unsigned.ipa
+          if-no-files-found: error
+
+      - name: Publish GitHub Release with IPA
+        run: |
+          set -e
+          TAG="unsigned-1.0.0"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" -y --cleanup-tag || true
+          fi
+          gh release create "$TAG" Opsflare-unsigned.ipa \
+            --title "Opsflare unsigned IPA" \
+            --notes "Unsigned iOS build of Opsflare (no code signing). Sideload with AltStore / Sideloadly / TrollStore, which will re-sign it with your own Apple ID."
+        env:
+          GH_TOKEN: ${{ github.token }}
