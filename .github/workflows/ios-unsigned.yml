@@ -102,16 +102,14 @@ jobs:
           # generic is never emitted in the framework binary — but Swift 6.2 fails
           # to emit it into clients (typed throws), leaving a dangling external
           # reference that kills the app at launch (dyld: Symbol not found).
-          # Dropping the attribute makes it a normal public symbol that dyld can
-          # resolve. Only the throwing overload is affected; the nonthrowing one
-          # inlines into clients fine.
           #
-          # ADDITIONALLY: Swift 6.2 mangles the library's inferred `E: Error`
-          # requirement (from throws(E)) differently than the client's interface
-          # reader does -> dyld mismatch. Using untyped `throws` (no generic E
-          # at all) sidesteps the issue entirely. `@_disfavoredOverload` keeps
-          # overload resolution unambiguous. All 7 client call sites just use
-          # `try` without relying on the concrete error type, so this is safe.
+          # ROOT CAUSE (verified): Swift 6.2's interface reader mishandles the
+          # generic signature, so the client mangles the symbol differently from
+          # the library. The fix is to avoid cross-module references entirely:
+          # keep @_alwaysEmitIntoClient (so it's inlined, never referenced) but
+          # simplify the signature to untyped `throws` with single generic `<T>`
+          # (no E, no ~Copyable) which the inliner can handle. `@_disfavoredOverload`
+          # keeps overload resolution unambiguous.
           old = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
@@ -130,6 +128,7 @@ jobs:
           )
           new = (
             "  /// Throwing counterpart to the nonthrowing overload above.\n"
+            "  @_alwaysEmitIntoClient\n"
             "  @_disfavoredOverload\n"
             "  @inline(__always)\n"
             "  public static func assumeIsolated<T>(\n"
