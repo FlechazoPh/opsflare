@@ -92,6 +92,38 @@ jobs:
           print("patched OK")
           EOF
 
+      - name: Patch JavaScriptActor for dyld (emit throwing assumeIsolated)
+        run: |
+          python3 - <<'EOF'
+          p = "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptActor.swift"
+          src = open(p).read()
+
+          # The throwing assumeIsolated overload is @_alwaysEmitIntoClient, so the
+          # generic is never emitted in the framework binary — but Swift 6.2 fails
+          # to emit it into clients (typed throws), leaving a dangling external
+          # reference that kills the app at launch (dyld: Symbol not found).
+          # Dropping the attribute makes it a normal public symbol that dyld can
+          # resolve. Only the throwing overload is affected; the nonthrowing one
+          # inlines into clients fine.
+          old = (
+            "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
+            "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
+            "  @_alwaysEmitIntoClient\n"
+            "  @inline(__always)\n"
+            "  public static func assumeIsolated<T: ~Copyable, E: Error>(\n"
+          )
+          new = (
+            "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
+            "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
+            "  @inline(__always)\n"
+            "  public static func assumeIsolated<T: ~Copyable, E: Error>(\n"
+          )
+          assert src.count(old) == 1, "throwing assumeIsolated pattern not found"
+          src = src.replace(old, new)
+          open(p, "w").write(src)
+          print("actor patched OK")
+          EOF
+
       - name: Expo prebuild (iOS)
         run: npx expo prebuild --platform ios --clean
 
