@@ -106,14 +106,11 @@ jobs:
           # resolve. Only the throwing overload is affected; the nonthrowing one
           # inlines into clients fine.
           #
-          # ADDITIONALLY: Swift 6.2's interface reader mishandles `~Copyable` in
-          # the swiftinterface where clause (it drops the requirements, so the
-          # client mangles the generic differently from the library -> dyld
-          # mismatch). Removing `~Copyable` from the source avoids the issue.
-          # `@_disfavoredOverload` keeps overload resolution unambiguous: the
-          # nonthrowing overload is preferred for non-throwing closures, the
-          # throwing one is used only when the closure throws (all existing
-          # callers already satisfy T: Copyable).
+          # ADDITIONALLY: Swift 6.2's interface reader drops where-clause
+          # requirements on this declaration, so the client mangles the generic
+          # differently from the library -> dyld mismatch. Declaring it with NO
+          # explicit requirements (throws(E) implies E: Error) aligns both sides.
+          # `@_disfavoredOverload` keeps overload resolution unambiguous.
           old = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
@@ -128,7 +125,7 @@ jobs:
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
             "  @_disfavoredOverload\n"
             "  @inline(__always)\n"
-            "  public static func assumeIsolated<T, E: Error>(\n"
+            "  public static func assumeIsolated<T, E>(\n"
             "    _ operation: @JavaScriptActor () throws(E) -> T\n"
             "  ) throws(E) -> T {\n"
           )
