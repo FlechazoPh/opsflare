@@ -159,6 +159,12 @@ jobs:
           sudo xcode-select -s "$(ls -d /Applications/Xcode_2*.app | sort -V | tail -1)/Contents/Developer"
           xcodebuild -version
 
+      - name: Prebuild ExpoModulesJSI xcframework (avoid race with client compile)
+        run: |
+          cd node_modules/expo-modules-jsi/apple
+          PODS_ROOT="$GITHUB_WORKSPACE/ios/Pods" PLATFORM_NAME=iphoneos ./scripts/build-xcframework.sh
+          grep -n "assumeIsolated" Products/ExpoModulesJSI.xcframework/ios-arm64/ExpoModulesJSI.framework/Modules/ExpoModulesJSI.swiftmodule/arm64-apple-ios.swiftinterface | head -5
+
       - name: Archive without code signing
         run: |
           set -e
