@@ -38,6 +38,19 @@ jobs:
           sed -i '' 's/SWIFT_RETURNS_RETAINED RuntimeScheduler(/RuntimeScheduler(/' "$H"
           grep -n "SWIFT_RETURNS_RETAINED" "$H" || echo "header patched clean"
 
+      - name: Patch ExpoModulesJSI SPM package to Swift 5 language mode
+        run: |
+          P="node_modules/expo-modules-jsi/apple/Package.swift"
+          # The nested xcodebuild (env -i) doesn't inherit our SWIFT_VERSION=5.0.
+          # swift-tools 6.2 defaults the package to Swift 6 mode, whose strict
+          # concurrency checks reject this SDK's nonisolated(unsafe) captures
+          # under the Xcode 26.3 compiler. Pin the language mode to v5 instead.
+          if ! grep -q "swiftLanguageMode(.v5)" "$P"; then
+            sed -i '' 's/\.interoperabilityMode(\.Cxx),/.interoperabilityMode(.Cxx),\
+            .swiftLanguageMode(.v5),/' "$P"
+          fi
+          grep -n "swiftLanguageMode" "$P"
+
       - name: Expo prebuild (iOS)
         run: npx expo prebuild --platform ios --clean
 
