@@ -106,24 +106,27 @@ jobs:
           # resolve. Only the throwing overload is affected; the nonthrowing one
           # inlines into clients fine.
           #
-          # ADDITIONALLY: Swift 6.2's swiftinterface serialization drops the
-          # `~Copyable` inverse requirement (interface shows `<T, E>` while the
-          # source says `<T: ~Copyable, ...>`), so the library and the client
-          # mangle the generic differently -> dyld mismatch. Removing `~Copyable`
-          # from the source aligns both sides. All existing callers already
-          # compile against the interface without it, so this is safe.
+          # ADDITIONALLY: Swift 6.2 serializes `<T: ~Copyable, E: Error>` into the
+          # swiftinterface as `<T, E> where E: Error, T: ~Copyable`, and the two
+          # forms mangle differently -> dyld mismatch. Writing the source in the
+          # same where-clause form aligns both sides (semantically identical, so
+          # no overload ambiguity).
           old = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
             "  @_alwaysEmitIntoClient\n"
             "  @inline(__always)\n"
             "  public static func assumeIsolated<T: ~Copyable, E: Error>(\n"
+            "    _ operation: @JavaScriptActor () throws(E) -> T\n"
+            "  ) throws(E) -> T {\n"
           )
           new = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
             "  @inline(__always)\n"
-            "  public static func assumeIsolated<T, E: Error>(\n"
+            "  public static func assumeIsolated<T, E>(\n"
+            "    _ operation: @JavaScriptActor () throws(E) -> T\n"
+            "  ) throws(E) -> T where E: Error, T: ~Copyable {\n"
           )
           assert src.count(old) == 1, "throwing assumeIsolated pattern not found"
           src = src.replace(old, new)
