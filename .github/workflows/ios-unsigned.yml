@@ -38,18 +38,59 @@ jobs:
           sed -i '' 's/SWIFT_RETURNS_RETAINED RuntimeScheduler(/RuntimeScheduler(/' "$H"
           grep -n "SWIFT_RETURNS_RETAINED" "$H" || echo "header patched clean"
 
-      - name: Patch ExpoModulesJSI SPM package to Swift 5 language mode
+      - name: Patch ExpoModulesJSI for Swift 6.2 (upstream UncheckedSendable fix)
         run: |
-          P="node_modules/expo-modules-jsi/apple/Package.swift"
-          # The nested xcodebuild (env -i) doesn't inherit our SWIFT_VERSION=5.0.
-          # swift-tools 6.2 defaults the package to Swift 6 mode, whose strict
-          # concurrency checks reject this SDK's nonisolated(unsafe) captures
-          # under the Xcode 26.3 compiler. Pin the language mode to v5 instead.
-          if ! grep -q "swiftLanguageMode(.v5)" "$P"; then
-            sed -i '' 's/\.interoperabilityMode(\.Cxx),/.interoperabilityMode(.Cxx),\
-            .swiftLanguageMode(.v5),/' "$P"
-          fi
-          grep -n "swiftLanguageMode" "$P"
+          python3 - <<'EOF'
+          p = "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift"
+          src = open(p).read()
+
+          # 1. Add the UncheckedSendable wrapper before the first createFunctionClosure
+          wrapper = (
+            "/// Unchecked Sendable wrapper for call-scoped raw pointers captured by\n"
+            "/// synchronously-executed closures. Mirrors the upstream fix for the\n"
+            "/// Swift 6.2 compiler, which rejects `nonisolated(unsafe)` captures in\n"
+            "/// global-actor-isolated closures.\n"
+            "private struct UncheckedSendable<T>: @unchecked Sendable {\n"
+            "  let value: T\n"
+            "  init(_ value: T) { self.value = value }\n"
+            "}\n"
+            "\n"
+          )
+          assert "struct UncheckedSendable" not in src
+          src = src.replace("private func createFunctionClosure(", wrapper + "private func createFunctionClosure(", 1)
+
+          # 2. Swap nonisolated(unsafe) captures for UncheckedSendable (both overloads)
+          old_lets = "\n".join([
+            "    nonisolated(unsafe) let thisPtr = thisPtr",
+            "    nonisolated(unsafe) let argumentsPtr = argumentsPtr",
+            "    nonisolated(unsafe) let resultPtr = resultPtr",
+          ])
+          new_lets = "\n".join([
+            "    let thisPtr = UncheckedSendable(thisPtr)",
+            "    let argumentsPtr = UncheckedSendable(argumentsPtr)",
+            "    let resultPtr = UncheckedSendable(resultPtr)",
+          ])
+          n = src.count(old_lets)
+          assert n == 2, f"expected 2 capture blocks, found {n}"
+          src = src.replace(old_lets, new_lets)
+
+          # 3. Update use sites to go through .value
+          # (leading \n anchors the 6-space indent: the 8-space HostObjectContext
+          # site must stay untouched)
+          reps = [
+            ("\n      resultPtr.pointee = JavaScriptActor.assumeIsolated {", "\n      resultPtr.value.pointee = JavaScriptActor.assumeIsolated {"),
+            ("UnsafeMutablePointer(mutating: thisPtr).move()", "UnsafeMutablePointer(mutating: thisPtr.value).move()"),
+            ("start: argumentsPtr, count:", "start: argumentsPtr.value, count:"),
+            ("JavaScriptUnownedValue(runtime.pointee, thisPtr)", "JavaScriptUnownedValue(runtime.pointee, thisPtr.value)"),
+          ]
+          for old, new in reps:
+            c = src.count(old)
+            assert c >= 1, f"pattern not found: {old}"
+            src = src.replace(old, new)
+
+          open(p, "w").write(src)
+          print("patched OK")
+          EOF
 
       - name: Expo prebuild (iOS)
         run: npx expo prebuild --platform ios --clean
