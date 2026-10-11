@@ -152,6 +152,13 @@ jobs:
             CODE_SIGN_STYLE=Manual \
             archive
 
+      - name: Dump swiftinterface (diagnostic)
+        if: always()
+        run: |
+          SI=$(find node_modules/expo-modules-jsi/apple/Products/ExpoModulesJSI.xcframework -name "*.swiftinterface" | head -1)
+          echo "interface: $SI"
+          grep -n -B3 -A3 "assumeIsolated" "$SI" | head -40
+
       - name: Package unsigned IPA
         run: |
           set -e
