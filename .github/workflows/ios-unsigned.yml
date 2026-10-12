@@ -146,6 +146,147 @@ jobs:
           print("actor patched OK")
           EOF
 
+      - name: Patch expo-modules-core call sites (v20 bypass throwing assumeIsolated)
+        run: |
+          python3 - <<'EOF'
+          # v20: the throwing JavaScriptActor.assumeIsolated overload cannot be
+          # referenced cross-module under Swift 6.2 (dyld "Symbol not found" at
+          # launch — the client mangles a different symbol than the library
+          # emits, and @_alwaysEmitIntoClient fails to inline it away; builds
+          # 10-19 all verified broken). Bypass it at all 7 throwing call sites
+          # in expo-modules-core by capturing the thrown error in Result, so
+          # only the non-throwing overload (which links fine) is referenced
+          # cross-module. Semantics are unchanged: the same error value is
+          # rethrown to the caller.
+
+          def patch(path, old, new, count=1):
+              src = open(path).read()
+              found = src.count(old)
+              assert found == count, f"{path}: expected {count}, found {found}"
+              open(path, "w").write(src.replace(old, new))
+              print(f"OK {path}")
+
+          CORE = "node_modules/expo-modules-core/ios"
+
+          # 1. JSValueDecoder.swift — decodeUsingDynamicType
+          patch(f"{CORE}/Core/JSValueDecoder.swift",
+          """      let anyValue = try JavaScriptActor.assumeIsolated {
+                  return try dynamicType.cast(jsValue: jsValue, appContext: appContext)
+                }
+          """,
+          """      // v20: bypass the throwing assumeIsolated overload (Swift 6.2 dyld
+                // symbol mismatch). Result captures the error so only the non-throwing
+                // overload is referenced cross-module; the same error is rethrown.
+                let isolatedResult: Result<Any, any Error> = JavaScriptActor.assumeIsolated {
+                  Result {
+                    return try dynamicType.cast(jsValue: jsValue, appContext: appContext)
+                  }
+                }
+                let anyValue = try isolatedResult.get()
+          """)
+
+          # 2. AppContext.swift — newObject(nativeClassId:)
+          patch(f"{CORE}/Core/AppContext.swift",
+          """    return try JavaScriptActor.assumeIsolated {
+                let prototype = try jsClass.getProperty("prototype").asObject()
+                return try runtime.createObject(prototype: prototype)
+              }
+          """,
+          """    // v20: bypass the throwing assumeIsolated overload (Swift 6.2 dyld
+              // symbol mismatch). Result captures the error so only the non-throwing
+              // overload is referenced cross-module; the same error is rethrown.
+              let isolatedResult: Result<JavaScriptObject?, any Error> = JavaScriptActor.assumeIsolated {
+                Result {
+                  let prototype = try jsClass.getProperty("prototype").asObject()
+                  return try runtime.createObject(prototype: prototype)
+                }
+              }
+              return try isolatedResult.get()
+          """)
+
+          # 3. AppContext.swift — prepareUIRuntime() (multi-statement body)
+          p = f"{CORE}/Core/AppContext.swift"
+          lines = open(p).read().split("\n")
+          starts = [i for i, l in enumerate(lines) if l == "    try JavaScriptActor.assumeIsolated {"]
+          assert len(starts) == 1, f"prepareUIRuntime call site not unique: {starts}"
+          start = starts[0]
+          tails = [i for i in range(start, len(lines)) if lines[i] == "      try installModuleClasses(in: uiRuntime)"]
+          assert len(tails) == 1, "prepareUIRuntime body tail not unique"
+          tail = tails[0]
+          assert lines[tail + 1] == "    }" and lines[tail + 2] == "  }", "prepareUIRuntime tail changed"
+          lines[start] = (
+              "    // v20: bypass the throwing assumeIsolated overload (Swift 6.2 dyld\n"
+              "    // symbol mismatch). Result captures the error so only the non-throwing\n"
+              "    // overload is referenced cross-module; the same error is rethrown.\n"
+              "    let isolatedResult: Result<Void, any Error> = JavaScriptActor.assumeIsolated {\n"
+              "      Result {"
+          )
+          lines.insert(tail + 1, "      }")          # closes Result
+          lines.insert(tail + 3, "    try isolatedResult.get()")
+          open(p, "w").write("\n".join(lines))
+          print(f"OK {p} (prepareUIRuntime)")
+
+          # 4. DynamicSharedObjectType.swift — getBaseSharedType
+          patch(f"{CORE}/Core/DynamicTypes/DynamicSharedObjectType.swift",
+          """  return try JavaScriptActor.assumeIsolated {
+              return try isSharedRef ? appContext.runtime.getSharedRefClass() : appContext.runtime.getSharedObjectClass()
+            }
+          """,
+          """  // v20: bypass the throwing assumeIsolated overload (Swift 6.2 dyld
+            // symbol mismatch). Result captures the error so only the non-throwing
+            // overload is referenced cross-module; the same error is rethrown.
+            let isolatedResult: Result<JavaScriptFunction, any Error> = JavaScriptActor.assumeIsolated {
+              Result {
+                return try isSharedRef ? appContext.runtime.getSharedRefClass() : appContext.runtime.getSharedObjectClass()
+              }
+            }
+            return try isolatedResult.get()
+          """)
+
+          # 5. DynamicRawType.swift — convertResult
+          patch(f"{CORE}/Core/DynamicTypes/DynamicRawType.swift",
+          """      return try JavaScriptActor.assumeIsolated {
+                  return try objectBuilder.build(appContext: appContext).asValue()
+                }
+          """,
+          """      // v20: bypass the throwing assumeIsolated overload (Swift 6.2 dyld
+                // symbol mismatch). Result captures the error so only the non-throwing
+                // overload is referenced cross-module; the same error is rethrown.
+                let isolatedResult: Result<JavaScriptValue, any Error> = JavaScriptActor.assumeIsolated {
+                  Result {
+                    return try objectBuilder.build(appContext: appContext).asValue()
+                  }
+                }
+                return try isolatedResult.get()
+          """)
+
+          # 6+7. DynamicConvertibleType.swift — directJSValueIfPossible (two identical sites)
+          patch(f"{CORE}/Core/DynamicTypes/DynamicConvertibleType.swift",
+          """      return try JavaScriptActor.assumeIsolated {
+                  try value.toObject(appContext: appContext).asValue()
+                }
+          """,
+          """      // v20: bypass the throwing assumeIsolated overload (Swift 6.2 dyld
+                // symbol mismatch). Result captures the error so only the non-throwing
+                // overload is referenced cross-module; the same error is rethrown.
+                let isolatedResult: Result<JavaScriptValue, any Error> = JavaScriptActor.assumeIsolated {
+                  Result {
+                    try value.toObject(appContext: appContext).asValue()
+                  }
+                }
+                return try isolatedResult.get()
+          """, count=2)
+
+          # Final guard: no throwing-overload call site may remain in expo-modules-core
+          import subprocess
+          out = subprocess.run(
+              ["grep", "-rn", "try JavaScriptActor.assumeIsolated", "node_modules/expo-modules-core"],
+              capture_output=True, text=True).stdout
+          remaining = [l for l in out.splitlines() if "try JavaScriptActor.assumeIsolated" in l]
+          assert not remaining, f"unpatched throwing call sites remain: {remaining}"
+          print("v20 call-site bypass applied cleanly (7 sites)")
+          EOF
+
       - name: Expo prebuild (iOS)
         run: npx expo prebuild --platform ios --clean
 
@@ -179,6 +320,32 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             CODE_SIGN_STYLE=Manual \
             archive
+
+      - name: Verify no dangling throwing assumeIsolated reference (v20 gate)
+        run: |
+          set -e
+          # The v20 bypass must leave zero cross-module references to the
+          # throwing overload. Its mangling contains XEKRi_z (typed throws(E)
+          # with the ~Copyable inverse constraint); the non-throwing overload
+          # is fine and expected to appear.
+          found=0
+          while IFS= read -r bin; do
+            if file -b "$bin" | grep -q "Mach-O"; then
+              hits=$(nm -u "$bin" 2>/dev/null | grep "assumeIsolated" | grep "XEKRi_z" || true)
+              if [ -n "$hits" ]; then
+                echo "DANGLING throwing assumeIsolated in $bin:"
+                echo "$hits"
+                found=1
+              else
+                echo "clean: $bin"
+              fi
+            fi
+          done < <(find build/Opsflare.xcarchive -type f \( -name "Opsflare" -o -name "ExpoModulesCore" \))
+          if [ "$found" -ne 0 ]; then
+            echo "FAIL: throwing assumeIsolated still referenced — app would crash at launch"
+            exit 1
+          fi
+          echo "v20 gate passed: no throwing assumeIsolated references"
 
       - name: Dump swiftinterface (diagnostic)
         if: always()
