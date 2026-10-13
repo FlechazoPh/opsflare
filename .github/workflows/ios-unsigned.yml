@@ -92,24 +92,19 @@ jobs:
           print("patched OK")
           EOF
 
-      - name: Patch JavaScriptActor for dyld (emit throwing assumeIsolated)
+      - name: Patch JavaScriptActor for dyld (v21 delete throwing assumeIsolated)
         run: |
           python3 - <<'EOF'
           p = "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptActor.swift"
           src = open(p).read()
 
-          # The throwing assumeIsolated overload is @_alwaysEmitIntoClient, so the
-          # generic is never emitted in the framework binary — but Swift 6.2 fails
-          # to emit it into clients (typed throws), leaving a dangling external
-          # reference that kills the app at launch (dyld: Symbol not found).
-          #
-          # ROOT CAUSE (verified): Swift 6.2's interface reader mishandles the
-          # generic signature, so the client mangles the symbol differently from
-          # the library. The fix is to avoid cross-module references entirely:
-          # keep @_alwaysEmitIntoClient (so it's inlined, never referenced) but
-          # simplify the signature to untyped `throws` with single generic `<T>`
-          # (no E, no ~Copyable) which the inliner can handle. `@_disfavoredOverload`
-          # keeps overload resolution unambiguous.
+          # v21: the throwing assumeIsolated overload cannot be referenced
+          # cross-module under Swift 6.2 (dyld "Symbol not found" at launch).
+          # v20 bypassed it at all 7 expo-modules-core call sites, yet the
+          # binary still emitted the old typed-throws mangling — the reference
+          # source is not in any text call site. Delete the overload entirely:
+          # it can never be referenced again, and any straggler becomes a
+          # compile error with file/line instead of a launch crash.
           old = (
             "  /// Throwing counterpart to the nonthrowing overload above. The generic error type keeps\n"
             "  /// `operation` nonescaping while preserving the exact error it can throw.\n"
@@ -126,24 +121,12 @@ jobs:
             "    return try result.get()\n"
             "  }\n"
           )
-          new = (
-            "  /// Throwing counterpart to the nonthrowing overload above.\n"
-            "  @_alwaysEmitIntoClient\n"
-            "  @_disfavoredOverload\n"
-            "  @inline(__always)\n"
-            "  public static func assumeIsolated<T>(\n"
-            "    _ operation: @JavaScriptActor () throws -> T\n"
-            "  ) throws -> T {\n"
-            "    let result: Result<T, any Error> = assumeIsolated {\n"
-            "      return Result(catching: operation)\n"
-            "    }\n"
-            "    return try result.get()\n"
-            "  }\n"
-          )
+          # v21: delete the throwing overload entirely (see comment above).
+          new = ""
           assert src.count(old) == 1, "throwing assumeIsolated pattern not found"
           src = src.replace(old, new)
           open(p, "w").write(src)
-          print("actor patched OK")
+          print("throwing assumeIsolated overload deleted (v21)")
           EOF
 
       - name: Patch expo-modules-core call sites (v20 bypass throwing assumeIsolated)
@@ -285,6 +268,86 @@ jobs:
           remaining = [l for l in out.splitlines() if "try JavaScriptActor.assumeIsolated" in l]
           assert not remaining, f"unpatched throwing call sites remain: {remaining}"
           print("v20 call-site bypass applied cleanly (7 sites)")
+          EOF
+
+      - name: Patch ExpoModulesJSI internal throwing call sites (v21)
+        run: |
+          python3 - <<'EOF'
+          # v21: with the throwing assumeIsolated overload deleted, the 4 internal
+          # throwing call sites in expo-modules-jsi must also bypass it (or they
+          # become compile errors). do/catch captures the error so only the
+          # non-throwing overload is referenced. Semantics unchanged: the same
+          # error value is rethrown to the caller.
+
+          def patch(path, old, new, count=1):
+              src = open(path).read()
+              found = src.count(old)
+              assert found == count, f"{path}: expected {count}, found {found}"
+              open(path, "w").write(src.replace(old, new))
+              print(f"OK {path}")
+
+          JSI = "node_modules/expo-modules-jsi/apple/Sources/ExpoModulesJSI/Runtime/JavaScriptRuntime.swift"
+
+          # 1+2. execute() fast paths (sync and async) — identical text, count=2
+          patch(JSI,
+          """      return try JavaScriptActor.assumeIsolated(closure)
+          """,
+          """      // v21: throwing assumeIsolated overload deleted (Swift 6.2 dyld symbol
+                // mismatch). do/catch captures the error so only the non-throwing
+                // overload is referenced; the same error is rethrown to the caller.
+                let isolatedResult: Result<R, any Error> = JavaScriptActor.assumeIsolated { () -> Result<R, any Error> in
+                  do {
+                    return .success(try closure())
+                  } catch {
+                    return .failure(error)
+                  }
+                }
+                return try isolatedResult.get()
+          """, count=2)
+
+          # 3. execute() scheduled path — result = .success(...)
+          patch(JSI,
+          """        result = .success(try JavaScriptActor.assumeIsolated(closure))
+          """,
+          """        // v21: throwing assumeIsolated overload deleted (Swift 6.2 dyld symbol
+                  // mismatch). do/catch captures the error so only the non-throwing
+                  // overload is referenced; the same error is rethrown to the caller.
+                  let isolatedResult: Result<R, any Error> = JavaScriptActor.assumeIsolated { () -> Result<R, any Error> in
+                    do {
+                      return .success(try closure())
+                    } catch {
+                      return .failure(error)
+                    }
+                  }
+                  result = .success(try isolatedResult.get())
+          """)
+
+          # 4. execute() async continuation — resume(returning:)
+          patch(JSI,
+          """          continuation.resume(returning: try JavaScriptActor.assumeIsolated(closure))
+          """,
+          """          // v21: throwing assumeIsolated overload deleted (Swift 6.2 dyld symbol
+                    // mismatch). do/catch captures the error so only the non-throwing
+                    // overload is referenced; the same error is rethrown to the caller.
+                    let isolatedResult: Result<R, any Error> = JavaScriptActor.assumeIsolated { () -> Result<R, any Error> in
+                      do {
+                        return .success(try closure())
+                      } catch {
+                        return .failure(error)
+                      }
+                    }
+                    continuation.resume(returning: try isolatedResult.get())
+          """)
+
+          # Final guard: no throwing-overload call site may remain in expo-modules-jsi
+          import subprocess
+          out = subprocess.run(
+              ["grep", "-rn", "try JavaScriptActor.assumeIsolated", "node_modules/expo-modules-jsi/apple/Sources"],
+              capture_output=True, text=True).stdout
+          remaining = [l for l in out.splitlines()
+                       if "try JavaScriptActor.assumeIsolated" in l and "/Tests/" not in l]
+          assert not remaining, f"unpatched throwing call sites remain: {remaining}"
+          print("v21 JSI bypass applied cleanly (4 sites)")
           EOF
 
       - name: Expo prebuild (iOS)
